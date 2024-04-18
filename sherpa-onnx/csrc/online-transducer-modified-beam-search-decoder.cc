@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+
 #include "sherpa-onnx/csrc/log.h"
 #include "sherpa-onnx/csrc/onnx-utils.h"
 
@@ -99,12 +100,15 @@ void OnlineTransducerModifiedBeamSearchDecoder::Decode(
   }
   std::vector<Hypothesis> prev;
 
+  // K: loop over frames
   for (int32_t t = 0; t != num_frames; ++t) {
     // Due to merging paths with identical token sequences,
     // not all utterances have "num_active_paths" paths.
     auto hyps_row_splits = GetHypsRowSplits(cur);
     int32_t num_hyps =
-        hyps_row_splits.back();  // total num hyps for all utterance
+        hyps_row_splits.back();  // total num hyps for all utterances
+                                 //
+    // K: pool hyps from all utterances
     prev.clear();
     for (auto &hyps : cur) {
       for (auto &h : hyps) {
@@ -128,38 +132,60 @@ void OnlineTransducerModifiedBeamSearchDecoder::Decode(
     Ort::Value logit =
         model_->RunJoiner(std::move(cur_encoder_out), View(&decoder_out));
 
+    // K: Joiner output
     float *p_logit = logit.GetTensorMutableData<float>();
+
+    // copy raw logits, apply temperature-scaling (for confidences)
+    int32_t p_logit_items = vocab_size * num_hyps;
+    std::vector<float> logit_with_temperature(p_logit_items);
+    {
+      std::copy(p_logit, p_logit + p_logit_items, logit_with_temperature.begin());
+      //float temperature_scale = 1.5; // TODO: set externally ?
+      //float temperature_scale = 2.5; // TODO: set externally ?
+      float temperature_scale = 2.0; // TODO: set externally ?
+      for (float& elem : logit_with_temperature) {
+        elem /= temperature_scale;
+      }
+      LogSoftmax(logit_with_temperature.data(), vocab_size, num_hyps);
+    }
+
     if (blank_penalty_ > 0.0) {
       // assuming blank id is 0
       SubtractBlank(p_logit, vocab_size, num_hyps, 0, blank_penalty_);
     }
-    LogSoftmax(p_logit, vocab_size, num_hyps);
+    LogSoftmax(p_logit, vocab_size, num_hyps); // K: renormalize along #bpe axis
 
     // now p_logit contains log_softmax output, we rename it to p_logprob
     // to match what it actually contains
     float *p_logprob = p_logit;
 
     // add log_prob of each hypothesis to p_logprob before taking top_k
-    for (int32_t i = 0; i != num_hyps; ++i) {
-      float log_prob = prev[i].log_prob + prev[i].lm_log_prob;
-      for (int32_t k = 0; k != vocab_size; ++k, ++p_logprob) {
+    // K: add log-prob sum from previous-path
+    for (int32_t i = 0; i != num_hyps; ++i) { // K: loop(hyps)
+      float log_prob = prev[i].log_prob + prev[i].lm_log_prob; // K: prev log-prob
+      for (int32_t k = 0; k != vocab_size; ++k, ++p_logprob) { // K: loop(vocab)
         *p_logprob += log_prob;
       }
     }
+    // K: set pointer back to beginning of 'logit'.
     p_logprob = p_logit;  // we changed p_logprob in the above for loop
 
-    for (int32_t b = 0; b != batch_size; ++b) {
+    // K: extend all Hypothesis with new output symbol
+    for (int32_t b = 0; b != batch_size; ++b) { // K: loop(hyps)
       int32_t frame_offset = (*result)[b].frame_offset;
       int32_t start = hyps_row_splits[b];
       int32_t end = hyps_row_splits[b + 1];
+      // K: top-k bpe symbols for all hyps from same stream
+      //    (this is doing beam search)
       auto topk =
           TopkIndex(p_logprob, vocab_size * (end - start), max_active_paths_);
 
-      Hypotheses hyps;
-      for (auto k : topk) {
+      Hypotheses hyps; // K: empty, all hyps from same stream
+      for (auto k : topk) { // K: loop over topk continuations of all hyps from same stream
         int32_t hyp_index = k / vocab_size + start;
         int32_t new_token = k % vocab_size;
 
+        // K: get previous hyp
         Hypothesis new_hyp = prev[hyp_index];
         const float prev_lm_log_prob = new_hyp.lm_log_prob;
         float context_score = 0;
@@ -167,6 +193,7 @@ void OnlineTransducerModifiedBeamSearchDecoder::Decode(
 
         // blank is hardcoded to 0
         // also, it treats unk as blank
+        // K: extend the `new_hyp`
         if (new_token != 0 && new_token != unk_id_) {
           new_hyp.ys.push_back(new_token);
           new_hyp.timestamps.push_back(t + frame_offset);
@@ -181,17 +208,25 @@ void OnlineTransducerModifiedBeamSearchDecoder::Decode(
             lm_->ComputeLMScore(lm_scale_, &new_hyp);
           }
         } else {
+          // K: count traling blanks for endpointing
           ++new_hyp.num_trailing_blanks;
         }
+        // K: accumulate logprob (values taken even for blank and unk)
+        //    (The 'context_score' is related to contextual biasing.)
         new_hyp.log_prob = p_logprob[k] + context_score -
                            prev_lm_log_prob;  // log_prob only includes the
                                               // score of the transducer
+        // K: export `new_hyp`
         // export the per-token log scores
         if (new_token != 0 && new_token != unk_id_) {
+          /*
           const Hypothesis &prev_i = prev[hyp_index];
           // subtract 'prev[i]' path scores, which were added before
           // getting topk tokens
           float y_prob = p_logprob[k] - prev_i.log_prob - prev_i.lm_log_prob;
+          new_hyp.ys_probs.push_back(y_prob);
+          */
+          float y_prob = logit_with_temperature[start * vocab_size + k];
           new_hyp.ys_probs.push_back(y_prob);
 
           if (lm_) {  // export only when LM is used
@@ -210,12 +245,14 @@ void OnlineTransducerModifiedBeamSearchDecoder::Decode(
 
         hyps.Add(std::move(new_hyp));
       }  // for (auto k : topk)
-      cur.push_back(std::move(hyps));
-      p_logprob += (end - start) * vocab_size;
-    }  // for (int32_t b = 0; b != batch_size; ++b)
-  }
 
-  for (int32_t b = 0; b != batch_size; ++b) {
+      cur.push_back(std::move(hyps)); // K: hyps for 1 stream
+      p_logprob += (end - start) * vocab_size; // K: advance the pointer to next stream
+    }  // for (int32_t b = 0; b != batch_size; ++b)
+  }  // for (int32_t t = 0; t != num_frames; ++t)
+
+  // K: export hyps to `OnlineTransducerDecoderResult result`
+  for (int32_t b = 0; b != batch_size; ++b) { // K: loop(streams)
     auto &hyps = cur[b];
     auto best_hyp = hyps.GetMostProbable(true);
     auto &r = (*result)[b];
