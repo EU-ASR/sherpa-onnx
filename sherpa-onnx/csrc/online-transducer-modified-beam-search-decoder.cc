@@ -140,9 +140,10 @@ void OnlineTransducerModifiedBeamSearchDecoder::Decode(
     std::vector<float> logit_with_temperature(p_logit_items);
     {
       std::copy(p_logit, p_logit + p_logit_items, logit_with_temperature.begin());
+      //float temperature_scale = 1.0; // TODO: set externally ?
       //float temperature_scale = 1.5; // TODO: set externally ?
-      //float temperature_scale = 2.5; // TODO: set externally ?
       float temperature_scale = 2.0; // TODO: set externally ?
+      //float temperature_scale = 2.5; // TODO: set externally ?
       for (float& elem : logit_with_temperature) {
         elem /= temperature_scale;
       }
@@ -210,6 +211,7 @@ void OnlineTransducerModifiedBeamSearchDecoder::Decode(
         } else {
           // K: count traling blanks for endpointing
           ++new_hyp.num_trailing_blanks;
+          new_hyp.blank_log_prob += logit_with_temperature[start * vocab_size + k];
         }
         // K: accumulate logprob (values taken even for blank and unk)
         //    (The 'context_score' is related to contextual biasing.)
@@ -226,8 +228,13 @@ void OnlineTransducerModifiedBeamSearchDecoder::Decode(
           float y_prob = p_logprob[k] - prev_i.log_prob - prev_i.lm_log_prob;
           new_hyp.ys_probs.push_back(y_prob);
           */
+          float blank_scale = 0.20;
           float y_prob = logit_with_temperature[start * vocab_size + k];
+          if (prev[hyp_index].num_trailing_blanks > 0) {
+            y_prob += blank_scale * new_hyp.blank_log_prob / prev[hyp_index].num_trailing_blanks;
+          }
           new_hyp.ys_probs.push_back(y_prob);
+          new_hyp.blank_log_prob = 0.0; // reset
 
           if (lm_) {  // export only when LM is used
             float lm_prob = new_hyp.lm_log_prob - prev_lm_log_prob;

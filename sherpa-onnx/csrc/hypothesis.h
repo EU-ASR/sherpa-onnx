@@ -51,6 +51,10 @@ struct Hypothesis {
   // LM log prob if any.
   double lm_log_prob = 0;
 
+  // Blank log prob product, for confidence measure.
+  // Computed from blanks preceding a non-blank output symbol.
+  double blank_log_prob = 0;
+
   // the nn lm score for next token given the current ys
   CopyableOrtValue nn_lm_scores;
   // the nn lm states
